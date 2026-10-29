@@ -60,6 +60,7 @@
 extern int nd_quant_p4_check(int64_t *pie_us, int64_t *c_us);
 extern void nd_quant_p4_init(void);
 extern void nd_quant_p4_lut2_enable(void);
+extern void nd_quant_p4_rows4_enable(void);
 
 static void dot128_selfcheck(const char *app)
 {
@@ -490,6 +491,10 @@ static int transcribe(float *x, uint32_t n, char *text, size_t cap)
         return -1;
     }
     t_enc = esp_timer_get_time();
+    printf("EVT decmem psram_free=%u psram_largest=%u\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    fflush(stdout);
     nt = nd_whistle_decode(&s_w, enc, T, -1 /* detect */, ids,
                            sizeof(ids) / sizeof(ids[0]));
     t_dec = esp_timer_get_time();
@@ -829,10 +834,13 @@ static void run_inference(const char *query)
 static void status_reprint(void)
 {
     if (s_st_ok)
-        printf("EVT ready model=whistle depth=%u enc_layers=%u d_model=%u vocab=%u "
+        printf("EVT ready model=whistle depth=%u enc_layers=%u dec_layers=%u d_model=%u vocab=%u "
+               "nh=%u nkv=%u qk=%u vd=%u max_seq=%u taps=%u "
                "psram_free=%u internal_free=%u\n",
                (unsigned)s_w.depth, (unsigned)s_w.enc_layers,
-               (unsigned)s_w.d, (unsigned)s_w.vocab,
+               (unsigned)s_w.dec_layers, (unsigned)s_w.d, (unsigned)s_w.vocab,
+               (unsigned)s_w.nh, (unsigned)s_w.nkv, (unsigned)s_w.qk,
+               (unsigned)s_w.vd, (unsigned)s_w.max_seq, (unsigned)s_w.taps,
                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     if (s_llm_ok) {
@@ -1047,8 +1055,9 @@ void app_main(void)
         return;
     mic_init();
     worker_start();
-    nd_quant_p4_init();   /* PSRAM staging mutex for the 2-bit GEMV tensors */
+    nd_quant_p4_init();   /* PSRAM staging mutex for the flash-mmap'd GEMV tensors */
     nd_quant_p4_lut2_enable();  /* PIE lut2 kernel: verify on first gemv */
+    nd_quant_p4_rows4_enable(); /* PIE 4-bit rows kernel (mHC phi) */
     dot128_selfcheck("needle_demo");
 
     if (nd_json_compact(TOOLS_RAW, strlen(TOOLS_RAW),
@@ -1072,9 +1081,12 @@ void app_main(void)
         for (k = 0; k < ND_WH_LANGS; k++)
             nd_whistle_add_keywords(&s_w, k, nd_led_keywords(k));
         printf("EVT ready model=whistle depth=%u enc_layers=%u d_model=%u vocab=%u "
+               "nh=%u nkv=%u qk=%u vd=%u max_seq=%u taps=%u "
                "psram_free=%u internal_free=%u\n",
                (unsigned)s_w.depth, (unsigned)s_w.enc_layers, (unsigned)s_w.d,
-               (unsigned)s_w.vocab,
+               (unsigned)s_w.vocab, (unsigned)s_w.nh, (unsigned)s_w.nkv,
+               (unsigned)s_w.qk, (unsigned)s_w.vd, (unsigned)s_w.max_seq,
+               (unsigned)s_w.taps,
                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     } else {

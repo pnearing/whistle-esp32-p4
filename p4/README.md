@@ -119,17 +119,23 @@ Use it either way:
   decoder depth
 
 Measured on this board (typed requests, reasoning off), after the LLM
-optimizations below: bench **4.5 tok/s (224 ms/tok; the S3 did 1.87** -
-2.4x), a full request ~7 s. Three stages got there:
+optimizations below: bench **4.87 tok/s (205 ms/tok; the S3 did 1.87** -
+2.6x), a full request ~6 s. Five stages got there:
 
 1. **PSRAM staging**: the 2-bit weights stream from flash mmap (~33 MB/s),
    which capped the LUT GEMV. Each tensor is copied to PSRAM on first use
-   (hidden in the boot prime; `EVT lut2 staged` lines). 2.45 -> 3.0 tok/s.
+   (hidden in the boot prime; `EVT p4 staged` lines). 2.45 -> 3.0 tok/s.
    The staging table was first capped at 96 entries, which only covered
    layers 0-18 (5.4 MB); the 10.5 MB byte budget was never the limiter.
    Raising the entry cap to cover all 139 lut2 tensors (7.8 MB) staged
    every attention projection + the 2-bit engram tables: 3.83 -> 4.46
-   tok/s, proj2bit 127 -> 84 ms, engram 11 -> 4 ms.
+   tok/s, proj2bit 127 -> 84 ms, engram 11 -> 4 ms. The same hook now
+   also stages the 4-bit mHC phi stacks through `nd_cq_gemv_rows` (3
+   tensors, 684 KB; sources already in PSRAM - the SD-loaded Whistle
+   model - are skipped by an `esp_ptr_external_ram` guard): 142 entries,
+   8.5 MB total, mhc_phi4 32 -> 24 ms, 4.46 -> 4.64 tok/s. (Stage 3
+   later dropped the phi staging again: the dec4 cache replaces it, so
+   140 staged entries + 1.4 MB of dec4, 9.3 MB of the 10.5 MB budget.)
 2. **PIE bit-plane kernel**: PIE has no gather, so the 2-bit LUT path is
    decomposed bilinearly (cb[lo+2hi] expands to 4 coefficients) and the
    three bit-plane sums (lo, 2*hi, lo*hi via `vcmp.eq.s8` masks) come out
@@ -140,6 +146,48 @@ optimizations below: bench **4.5 tok/s (224 ms/tok; the S3 did 1.87** -
    + <2% composed error) and a first-gemv comparison against the float LUT
    path (<10%; real quant noise is ~3%) - failing either falls back to the
    float path automatically. 3.0 -> 3.7 tok/s, prime 40 -> 25 s.
+3. **PIE decoded-rows kernel for the 4-bit phi GEMV**: the mHC phi
+   weights are constant across tokens, so each row is decoded once from
+   4-bit to int8 (the same per-row decode the engine's int8 GEMM uses)
+   and cached in PSRAM (`EVT p4 dec4`); per token the GEMV is then
+   `dot128_s8` groups over an int8-quantised xh (side tables rebuilt
+   once per layer, keyed on a prepare sequence counter). The remaining
+   mhc_phi4 time was ~7.5 ms of engine FWHT in `nd_cq_prepare`
+   (addressed by stage 4), ~6 ms of PSRAM-bound PIE dots, ~3 ms
+   activation quantise.
+   Verified like the lut2 kernel (synthetic boot check + first-gemv
+   compare, 1.3% real error); the packed phi blobs are no longer staged
+   (dec4 decodes straight from the flash mapping), freeing 684 KB of
+   the staging budget. 4.64 -> 4.77 tok/s, mhc_phi4 23.7 -> 16.9 ms.
+4. **Unrolled bit-identical FWHT**: every prepare (phi, q_proj, out_proj,
+   embedding) runs 16 groups of FWHT(128), and the layer "hadamard"
+   sandwich runs two FWHT(512) - all through the engine's `nd_fwht`, one
+   butterfly at a time with load->store serialization (~12 cycles per
+   butterfly). Running the same butterflies in the same stage order but
+   batched (all loads before stores) and unrolled is bit-identical by
+   construction - and provably so on device: the rows4 first-gemv verify
+   prints the exact same numbers as before the change (worst=157.36133,
+   mean=12090.36133). A boot check memcmp-verifies random data against
+   the scalar loops and falls back if they ever differ (`EVT p4 fwht ok`,
+   which also times both: 13.5 -> 9.5 us per FWHT(128)). 4.77 -> 4.87
+   tok/s: mhc_phi4 16.9 -> 15.1 ms, hadamard 12.4 -> 11.3 ms, prep+lut
+   9.9 -> 8.9 ms. The transform is load-latency-bound now (~1.45x is all
+   scalar C has in it); proj2bit (84 ms, 41%) dwarfs the rest.
+
+The denser staging made two latent Whistle bugs fatal (typed requests were
+fine; voice turns died). Both are fixed where they live:
+
+- `nd_quant.c` big-batch tiles (~33 KB) allocated INTERNAL-only with no
+  NULL guard: once internal SRAM fragmented, the stem gemms crashed with a
+  store to NULL. Tiles are now internal-first with a PSRAM fallback
+  (`nd_quant_scratch`), like the activation buffers.
+- `nd_whistle.c` decode sessions: the error path leaked every allocation
+  that had already succeeded (~1.7 MB per failed turn), and the KV caches
+  were sized `dec_layers x max_seq(320)` although a turn decodes at most
+  `min(ids cap, 8 + T/2)` positions - so `session_begin` failed for good
+  at ~3.3 MB free (`ERR decode`). It now frees on failure and clamps
+  `max_seq` to the caller's ids cap for the session. An `EVT decmem` line
+  before decode reports free/largest PSRAM block for field checks.
 
 ### The TUI
 
@@ -201,11 +249,12 @@ models are up.
       bit-identical to C, kernel race 25x, boot self-check in both apps;
       spoken-verified: 4.8 s total for 3.6 s of speech (~2.9x end-to-end,
       ~2.4x faster than the S3)
-- [x] LLM speed: PSRAM staging (all 139 lut2 tensors, 7.8 MB) + PIE
-      bit-plane kernel for the 2-bit LUT GEMV (`nd_cq_gemv_lut2`) -
-      2.45 -> 4.46 tok/s (~2.4x the S3), prime 40 -> 25 s; verified with
-      typed requests incl. a CONF 0.9994 call; automatic fallback to the
-      float path if either self-check fails
-- [ ] optional: depth/gain experiments; more LLM speed (next targets:
-      staging for the 4-bit rows path - mhc_phi4 ~32 ms still reads flash
-      directly - and PSRAM bandwidth: proj2bit is ~84 ms of 224)
+- [x] LLM speed: PSRAM staging (139 lut2 tensors + the 3 4-bit mHC phi
+      stacks, 8.5 MB total) + PIE bit-plane kernel for the 2-bit LUT GEMV
+      (`nd_cq_gemv_lut2`) + PIE decoded-int8-rows kernel for the 4-bit
+      phi GEMV (`nd_cq_gemv_rows`) + the unrolled bit-identical FWHT -
+      2.45 -> 4.87 tok/s (~2.6x the S3),
+      prime 40 -> ~21 s; verified with typed requests incl. a CONF 0.96
+      call; automatic fallback to the float path if any self-check fails
+- [ ] optional: depth/gain experiments; more LLM speed (next target:
+      PSRAM bandwidth - proj2bit ~84 ms of the 205 ms token)

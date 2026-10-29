@@ -5,7 +5,14 @@
  * engine's own nd_quant.c. It is a byte-for-byte copy plus:
  *   - a dot128_s8 branch for the ESP32-P4 HP core using the xesppie/xespv
  *     "PIE" DSP instructions (128-bit q registers + xacc accumulator), and
- *   - nd_quant_p4_check(), a boot-time asm-vs-C self check with timings.
+ *   - nd_quant_p4_check(), a boot-time asm-vs-C self check with timings,
+ *   - PSRAM flash staging (nd_p4_stage) for the flash-mmap'd weight blobs,
+ *     wired into the lut2 GEMV and nd_cq_gemv_rows (4-bit mHC phi stack),
+ *   - a PIE bit-plane kernel for the 2-bit LUT GEMV (nd_cq_gemv_lut2),
+ *     with boot-time and first-gemv self checks,
+ *   - a PIE decoded-int8-rows kernel for the 4-bit row GEMV (the mHC phi
+ *     stack), with the same boot-time and first-gemv self checks,
+ *   - an unrolled bit-identical fast FWHT (nd_fwht) with a boot self check.
  * Keep everything else in sync with the original file (a diff of the two
  * should show only those additions).
  * ------------------------------------------------------------------------ */
@@ -18,6 +25,7 @@
 #include "sdkconfig.h"
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
 #include "esp_timer.h"
+#include "esp_memory_utils.h"
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -30,6 +38,20 @@
 #define ND_QUANT_ALLOC(n) malloc(n)
 #define ND_QUANT_FREE(p)  free(p)
 #endif
+
+/* Scratch buffers (per-tile activations, LUT tables) prefer internal SRAM
+ * for cache reasons, but must never crash when internal SRAM is exhausted
+ * or fragmented: fall back to PSRAM. Returns NULL only if both heaps fail;
+ * callers guard and skip that one gemm. */
+static void *nd_quant_scratch(size_t n)
+{
+#ifdef ESP_PLATFORM
+    void *p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    return p ? p : heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
+#else
+    return malloc(n);
+#endif
+}
 
 #include <math.h>
 #include <string.h>
@@ -67,8 +89,130 @@ float nd_f16_slow(uint16_t h)
     }
 }
 
+#if defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32P4)
+/* --- P4 fast FWHT -------------------------------------------------------
+ * Same iterative butterflies as the reference below, in the same stage
+ * order (len = 1, 2, 4, ... ascending), but with the independent
+ * butterflies of each stage batched (loads before stores) and unrolled.
+ * The dataflow graph per element is identical, so the result is
+ * bit-identical to the reference; a boot-time self check on random data
+ * memcmp-verifies that and falls back to the scalar loops otherwise. */
+static int s_p4_fwht_ok = 1;
+
+static ND_HOT void nd_p4_fwht_core(float *x, uint32_t n)
+{
+    uint32_t j, len;
+
+    /* len = 1: adjacent pairs, four per iteration. */
+    for (j = 0; j < n; j += 8) {
+        float p0 = x[j],     p1 = x[j + 1], p2 = x[j + 2], p3 = x[j + 3];
+        float p4 = x[j + 4], p5 = x[j + 5], p6 = x[j + 6], p7 = x[j + 7];
+        x[j]     = p0 + p1;  x[j + 1] = p0 - p1;
+        x[j + 2] = p2 + p3;  x[j + 3] = p2 - p3;
+        x[j + 4] = p4 + p5;  x[j + 5] = p4 - p5;
+        x[j + 6] = p6 + p7;  x[j + 7] = p6 - p7;
+    }
+    /* len = 2: quads (j, j+2)(j+1, j+3), two blocks per iteration. */
+    for (j = 0; j < n; j += 8) {
+        float a0 = x[j],     a1 = x[j + 1], a2 = x[j + 4], a3 = x[j + 5];
+        float b0 = x[j + 2], b1 = x[j + 3], b2 = x[j + 6], b3 = x[j + 7];
+        x[j]     = a0 + b0;  x[j + 1] = a1 + b1;
+        x[j + 2] = a0 - b0;  x[j + 3] = a1 - b1;
+        x[j + 4] = a2 + b2;  x[j + 5] = a3 + b3;
+        x[j + 6] = a2 - b2;  x[j + 7] = a3 - b3;
+    }
+    /* len >= 4: four butterflies per iteration, all loads before stores. */
+    for (len = 4; len < n; len <<= 1) {
+        uint32_t i;
+        for (i = 0; i < n; i += len << 1)
+            for (j = i; j < i + len; j += 4) {
+                float a0 = x[j],         a1 = x[j + 1];
+                float a2 = x[j + 2],     a3 = x[j + 3];
+                float b0 = x[j + len],   b1 = x[j + 1 + len];
+                float b2 = x[j + 2 + len], b3 = x[j + 3 + len];
+                x[j]           = a0 + b0;  x[j + 1]       = a1 + b1;
+                x[j + 2]       = a2 + b2;  x[j + 3]       = a3 + b3;
+                x[j + len]     = a0 - b0;  x[j + 1 + len] = a1 - b1;
+                x[j + 2 + len] = a2 - b2;  x[j + 3 + len] = a3 - b3;
+            }
+    }
+}
+
+/* One-shot boot check: random vector through the scalar reference vs the
+ * fast core, bit-for-bit, plus rough timings for the log. */
+static int nd_p4_fwht(float *x, uint32_t n)
+{
+    static int checked;
+    if (!checked) {
+        static float ref[512], tst[512], sav[512];
+        uint32_t s = 4242u, sz, r;
+        int64_t t0;
+        int tref[2] = { 0, 0 }, tfst[2] = { 0, 0 }, ok = 1, k;
+
+        checked = 1;
+        for (sz = 0; sz < 512; sz++) {
+            s = s * 1664525u + 1013904223u;
+            ref[sz] = (float)(int)(s >> 8) * (1.0f / 8388608.0f);
+        }
+        for (k = 0; k < 2; k++) {
+            uint32_t cn = k ? 512u : 128u;
+            for (r = 0; r < 4; r++) {
+                memcpy(tst, ref, cn * sizeof(float));
+                t0 = esp_timer_get_time();
+                {
+                    /* scalar reference (the loop shape of nd_fwht) */
+                    uint32_t len;
+                    for (len = 1; len < cn; len <<= 1) {
+                        uint32_t i;
+                        for (i = 0; i < cn; i += len << 1) {
+                            uint32_t j;
+                            for (j = i; j < i + len; j++) {
+                                float a = tst[j], b = tst[j + len];
+                                tst[j]       = a + b;
+                                tst[j + len] = a - b;
+                            }
+                        }
+                    }
+                }
+                tref[k] += (int)(esp_timer_get_time() - t0);
+                memcpy(sav, tst, cn * sizeof(float));
+                memcpy(tst, ref, cn * sizeof(float));
+                t0 = esp_timer_get_time();
+                nd_p4_fwht_core(tst, cn);
+                tfst[k] += (int)(esp_timer_get_time() - t0);
+                if (memcmp(sav, tst, cn * sizeof(float)) != 0) {
+                    uint32_t d;
+                    for (d = 0; d < cn; d++)
+                        if (sav[d] != tst[d])
+                            break;
+                    printf("EVT p4 fwht mismatch n=%lu i=%lu %.6f %.6f\n",
+                           (unsigned long)cn, (unsigned long)d,
+                           sav[d], tst[d]);
+                    ok = 0;
+                    break;
+                }
+            }
+            if (!ok)
+                break;
+        }
+        if (ok)
+            printf("EVT p4 fwht ok n128 ref=%d fast=%d us n512 ref=%d fast=%d us\n",
+                   tref[0], tfst[0], tref[1], tfst[1]);
+        s_p4_fwht_ok = ok;
+    }
+    if (!s_p4_fwht_ok || n < 16u || (n & (n - 1u)))
+        return 0;
+    nd_p4_fwht_core(x, n);
+    return 1;
+}
+#endif /* ESP32P4 fast FWHT */
+
 ND_HOT void nd_fwht(float *x, uint32_t n)
 {
+#if defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32P4)
+    if (nd_p4_fwht(x, n))   /* P4 unrolled fast path */
+        return;
+#endif
     uint32_t len;
 
     for (len = 1; len < n; len <<= 1) {
@@ -90,6 +234,12 @@ uint32_t nd_cq_scratch(const nd_tensor *t)
     return nd_cq_in_pad(t);
 }
 
+#if defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32P4)
+/* Bumped by every nd_cq_prepare; keys the rows4 side-table cache so the
+ * three phi gemvs per layer share one int8 quantisation of xh. */
+static uint32_t s_p4_prep_seq;
+#endif
+
 void nd_cq_prepare(const nd_tensor *t, const float *x, float *xh)
 {
     uint32_t in_pad = nd_cq_in_pad(t);
@@ -109,6 +259,9 @@ void nd_cq_prepare(const nd_tensor *t, const float *x, float *xh)
         for (j = 0; j < g; j++)
             blk[j] *= scale;
     }
+#if defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32P4)
+    s_p4_prep_seq++;   /* invalidates the rows4 side tables (P4) */
+#endif
 }
 
 typedef struct {
@@ -199,6 +352,14 @@ static ND_HOT void gemv_rows_offset(void *vc, uint32_t i0, uint32_t i1)
     }
 }
 
+#if defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32P4)
+/* Forward: defined with the other P4 pieces (flash staging) further down. */
+static const void *nd_p4_stage(const void *src, uint32_t bytes);
+static int nd_p4_rows4_gemv(const nd_cact *c, const nd_tensor *t,
+                            const void *blob, const float *xh, uint32_t r0,
+                            uint32_t nrows, float *y);
+#endif
+
 ND_HOT void nd_cq_gemv_rows(const nd_cact *c, const nd_tensor *t, const void *blob,
                      const float *xh, uint32_t r0, uint32_t nrows, float *y)
 {
@@ -206,6 +367,25 @@ ND_HOT void nd_cq_gemv_rows(const nd_cact *c, const nd_tensor *t, const void *bl
     uint32_t       out      = t->shape[0];
     uint32_t       rowbytes = nd_cq_row_bytes(t);
     gemv_ctx       ctx;
+
+#if defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32P4)
+    /* Constant 4-bit rows (the 27-layer mHC phi stack): try the PIE
+     * decoded-int8 kernel first. It stages and verifies itself and falls
+     * back to the float path below (staging hits its cache) if it can't. */
+    if (nd_p4_rows4_gemv(c, t, blob, xh, r0, nrows, y))
+        return;
+#endif
+
+#if defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32P4)
+    /* The mHC phi tensors (4-bit rows) stream every layer's slice from the
+     * flash mmap on every token - ~0.7 MB/token at ~33 MB/s, which is what
+     * the mhc_phi4 profile row measures. Stage rows+norms into PSRAM on
+     * first use, exactly like the lut2 GEMV below; PSRAM-resident blobs
+     * (Whistle, loaded from SD) pass through the guard untouched. */
+    packed = (const uint8_t *)nd_p4_stage(
+        packed, (uint32_t)((size_t)out * rowbytes +
+                           (size_t)out * nd_cq_groups(t) * 2));
+#endif
 
     ctx.packed   = packed;
     ctx.norms    = (const uint16_t *)(const void *)(packed +
@@ -350,7 +530,7 @@ static ND_HOT void lut2_rows(void *vc, uint32_t r0, uint32_t r1)
 
 #if defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32P4)
 /* ------------------------------------------------------------------------
- * Flash staging for the 2-bit GEMV weights.
+ * Flash staging for the flash-mmap'd GEMV weights.
  *
  * needle2's tensors are mmap'd from SPI flash: ~33 MB/s sustained through
  * the cache, which is exactly what the LUT kernel achieves per token - the
@@ -358,12 +538,16 @@ static ND_HOT void lut2_rows(void *vc, uint32_t r0, uint32_t r1)
  * Stage each tensor's packed rows + norms into PSRAM on first use (they are
  * read-only afterwards). nd_parallel_rows runs us on both cores, so the
  * staging table is mutex-protected; copies happen during the boot prime.
+ * Two callers: the 2-bit LUT GEMV (attention projections, engram/mhc
+ * tables) and nd_cq_gemv_rows (the 4-bit mHC phi stack, ~0.7 MB more).
+ * Sources already in PSRAM (the SD-loaded Whistle model) are skipped via
+ * the esp_ptr_external_ram guard.
  *
  * needle2 needs 5 lut2 gemv tensors per layer x 27 layers = 135 attention
- * entries alone, plus 2-bit engram/mhc tables that arrive later in canon
- * order; the 10.5 MB byte budget (not this count) is the real limiter, so
- * keep MAX comfortably above the full tensor set to avoid silently
- * de-staging the tail layers back to flash speed.
+ * entries alone, plus 2-bit engram/mhc tables and the 3 phi stacks that
+ * arrive later in canon order; the 10.5 MB byte budget (not this count) is
+ * the real limiter, so keep MAX comfortably above the full tensor set to
+ * avoid silently de-staging the tail layers back to flash speed.
  * ------------------------------------------------------------------------ */
 #define ND_P4_STAGE_MAX    192
 #define ND_P4_STAGE_BUDGET (10u * 1024u * 1024u + 512u * 1024u)  /* 10.5 MB */
@@ -391,7 +575,8 @@ static const void *nd_p4_stage(const void *src, uint32_t bytes)
     uint8_t         *dst = NULL;
     int64_t          t0;
 
-    if (s_stage_mu == NULL || src == NULL || bytes == 0)
+    if (s_stage_mu == NULL || src == NULL || bytes == 0 ||
+        esp_ptr_external_ram(src))   /* Whistle blobs are already in PSRAM */
         return src;
     xSemaphoreTake(s_stage_mu, portMAX_DELAY);
     for (i = 0; i < s_stage_n; i++)
@@ -409,7 +594,7 @@ static const void *nd_p4_stage(const void *src, uint32_t bytes)
             e = &s_stage[s_stage_n++];
             e->src = src; e->dst = dst; e->bytes = bytes;
             s_stage_bytes += bytes;
-            printf("EVT lut2 staged %u bytes=%u total=%u ms=%d\n",
+            printf("EVT p4 staged %u bytes=%u total=%u ms=%d\n",
                    (unsigned)s_stage_n, (unsigned)bytes,
                    (unsigned)s_stage_bytes,
                    (int)((esp_timer_get_time() - t0) / 1000));
@@ -1198,6 +1383,391 @@ static inline int8_t q8(float v)
     return (int8_t)(int)(v + (v >= 0.0f ? 0.5f : -0.5f));
 }
 
+#if defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32P4)
+/* ------------------------------------------------------------------------
+ * Stage 3: PIE decoded-rows kernel for the 4-bit row GEMV (mHC phi).
+ *
+ * The phi stack (phi_pre/phi_post: 108 rows, phi_res: 432 rows; 648 rows
+ * per token) is the engine's only hot 4-bit gemv_rows user, and after
+ * flash staging it is compute-bound in the scalar dot_group loop. Its
+ * weights never change across tokens, so decode every row to int8 once -
+ * the same numerics the gemm8 path already ships: tab4 expansion of the
+ * LSB-first nibbles scaled by sw = 127/max|cb| - cache it in PSRAM, and
+ * per token quantise the prepared xh per 128-group and run the PIE
+ * dot128_s8 kernel over the decoded rows:
+ *   y[i] = sum_g nd_f16(nrm[r][g]) * (1/sw) * sx[g] * dot128(wq8[r], xq)
+ * The decoded bytes count against the staging budget (the three tensors
+ * add ~1.3 MB on top of the ~8.5 MB of packed copies). A boot-time
+ * synthetic check plus a 4-row float comparison on the first real gemv
+ * gate the kernel, exactly like the lut2 path above.
+ * ------------------------------------------------------------------------ */
+#define ND_P4_DEC4_MAX 8
+
+typedef struct {
+    const void *src;        /* packed blob identity (pre-staging ptr) */
+    int8_t     *wq8;        /* [out][in_pad] decoded int8 rows */
+    float      *coef;       /* [out][ngroup] nd_f16(norm) * inv_sw */
+    uint32_t    out, in_pad;
+    int         failed;     /* alloc/budget failure: stay on the float path */
+} nd_p4_dec4_ent;
+
+static nd_p4_dec4_ent s_dec4[ND_P4_DEC4_MAX];
+static uint32_t       s_dec4_n;
+static int            s_rows4_mode;   /* 0 float, 1 pie, 2 armed-verify */
+
+/* Per-token side tables: int8 xh (natural order) + per-group scales, in
+ * internal SRAM. Rebuilt only when a new nd_cq_prepare touched the buffer
+ * (s_p4_prep_seq), so the three phi gemvs of one layer share one build. */
+static int8_t *s_rxq;
+static float  *s_rsx;
+static int           s_rside_pad = -1;
+static const float *s_rside_xh;
+static uint32_t     s_rside_seq;
+
+static ND_HOT int pie_rows4_side(const float *xh, uint32_t in_pad)
+{
+    uint32_t ng = in_pad / 128u, g, j;
+
+    if (in_pad % 128u || ng == 0)
+        return 0;
+    if (s_rside_xh == xh && s_rside_seq == s_p4_prep_seq &&
+        s_rside_pad == (int)in_pad)
+        return 1;
+    if (s_rside_pad != (int)in_pad) {
+        if (s_rxq) {
+            heap_caps_free(s_rxq); heap_caps_free(s_rsx);
+            s_rxq = NULL; s_rsx = NULL;
+        }
+        s_rxq = heap_caps_aligned_alloc(16, in_pad, MALLOC_CAP_INTERNAL |
+                                                      MALLOC_CAP_8BIT);
+        s_rsx = heap_caps_aligned_alloc(16, ng * sizeof(float),
+                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (s_rxq == NULL || s_rsx == NULL) {
+            if (s_rxq) { heap_caps_free(s_rxq); s_rxq = NULL; }
+            if (s_rsx) { heap_caps_free(s_rsx); s_rsx = NULL; }
+            s_rside_pad = -1;
+            return 0;
+        }
+        s_rside_pad = (int)in_pad;
+    }
+    for (g = 0; g < ng; g++) {
+        const float *x = xh + g * 128u;
+        float m = 0.0f, inv;
+        for (j = 0; j < 128u; j += 4) {       /* unrolled abs-max */
+            float a0 = fabsf(x[j]),     a1 = fabsf(x[j + 1]);
+            float a2 = fabsf(x[j + 2]), a3 = fabsf(x[j + 3]);
+            if (a0 > m) m = a0;
+            if (a1 > m) m = a1;
+            if (a2 > m) m = a2;
+            if (a3 > m) m = a3;
+        }
+        /* One divide per group (RISC-V fdiv is slow and not pipelined),
+         * then multiply per element - same rounding as x/s with s=m/127. */
+        inv = m > 0.0f ? 127.0f / m : 1.0f;
+        for (j = 0; j < 128u; j += 4) {       /* unrolled round+clamp */
+            float x0 = x[j] * inv,     x1 = x[j + 1] * inv;
+            float x2 = x[j + 2] * inv, x3 = x[j + 3] * inv;
+            int q0 = (int)(x0 + copysignf(0.5f, x0));
+            int q1 = (int)(x1 + copysignf(0.5f, x1));
+            int q2 = (int)(x2 + copysignf(0.5f, x2));
+            int q3 = (int)(x3 + copysignf(0.5f, x3));
+            q0 = q0 > 127 ? 127 : (q0 < -127 ? -127 : q0);
+            q1 = q1 > 127 ? 127 : (q1 < -127 ? -127 : q1);
+            q2 = q2 > 127 ? 127 : (q2 < -127 ? -127 : q2);
+            q3 = q3 > 127 ? 127 : (q3 < -127 ? -127 : q3);
+            s_rxq[g * 128u + j]     = (int8_t)q0;
+            s_rxq[g * 128u + j + 1] = (int8_t)q1;
+            s_rxq[g * 128u + j + 2] = (int8_t)q2;
+            s_rxq[g * 128u + j + 3] = (int8_t)q3;
+        }
+        s_rsx[g] = m > 0.0f ? m / 127.0f : 1.0f;
+    }
+    s_rside_xh = xh;
+    s_rside_seq = s_p4_prep_seq;
+    return 1;
+}
+
+typedef struct {
+    const nd_p4_dec4_ent *e;
+    const int8_t *xq;
+    const float  *sx;
+    float        *y;
+    uint32_t      ngroup, base;
+} rows4_ctx;
+
+static ND_HOT void pie_rows4_rows(void *vc, uint32_t i0, uint32_t i1)
+{
+    const rows4_ctx      *rc = (const rows4_ctx *)vc;
+    const nd_p4_dec4_ent *e  = rc->e;
+    uint32_t              ng = rc->ngroup, in_pad = e->in_pad, i, gi;
+
+    for (i = i0; i < i1; i++) {
+        uint32_t       r    = rc->base + i;
+        const float   *co   = e->coef + (size_t)r * ng;
+        float          acc  = 0.0f;
+        for (gi = 0; gi < ng; gi++)
+            acc += co[gi] * rc->sx[gi] *
+                   (float)dot128_s8(e->wq8 + (size_t)r * in_pad + gi * 128u,
+                                    rc->xq + gi * 128u);
+        rc->y[i] = acc;
+    }
+}
+
+/* Decode all rows of a 4-bit tensor into the int8 cache (one time). */
+static nd_p4_dec4_ent *pie_rows4_dec4(const nd_cact *c, const nd_tensor *t,
+                                      const void *src)
+{
+    uint32_t out    = t->shape[0];
+    uint32_t in_pad = nd_cq_in_pad(t);
+    uint32_t ng     = in_pad / 128u;
+    uint32_t rowb   = nd_cq_row_bytes(t);
+    uint32_t bytes  = (uint32_t)((size_t)out * in_pad +
+                                 (size_t)out * ng * sizeof(float));
+    const float    *cb = nd_cact_codebook(c, t->bits);
+    const uint8_t  *packed;
+    uint16_t        tab4[256];
+    int8_t          lv[16];
+    float           mx = 0.0f, sw, inv_sw;
+    nd_p4_dec4_ent *e = NULL;
+    uint32_t        i, j, g;
+    int64_t         t0;
+
+    for (i = 0; i < s_dec4_n; i++)
+        if (s_dec4[i].src == src)
+            return s_dec4[i].failed ? NULL : &s_dec4[i];
+    if (s_dec4_n >= ND_P4_DEC4_MAX || s_stage_bytes + bytes > ND_P4_STAGE_BUDGET)
+        return NULL;
+
+    /* Decode straight from the (cacheable) flash mapping: one sequential
+     * pass at build time. Staging the packed copy would only serve the
+     * float fallback, which stages itself when actually taken - and a
+     * per-gemv nd_p4_stage call costs a mutex + scan every token. */
+    packed = (const uint8_t *)src;
+
+    for (i = 0; i < 16u; i++)
+        if (fabsf(cb[i]) > mx)
+            mx = fabsf(cb[i]);
+    sw     = mx > 0.0f ? 127.0f / mx : 1.0f;   /* all-zero codebook: dots 0 */
+    inv_sw = 1.0f / sw;
+    for (i = 0; i < 16u; i++)
+        lv[i] = q8(cb[i] * sw);
+    for (i = 0; i < 256u; i++)                 /* LSB-first index packing */
+        tab4[i] = (uint16_t)((uint8_t)lv[i & 15u] |
+                             (uint16_t)(uint8_t)lv[i >> 4] << 8);
+
+    e = &s_dec4[s_dec4_n];
+    e->src = src; e->out = out; e->in_pad = in_pad;
+    e->wq8 = heap_caps_aligned_alloc(16, (size_t)out * in_pad,
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    e->coef = heap_caps_aligned_alloc(16, (size_t)out * ng * sizeof(float),
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (e->wq8 == NULL || e->coef == NULL) {
+        if (e->wq8)  { heap_caps_free(e->wq8);  e->wq8  = NULL; }
+        if (e->coef) { heap_caps_free(e->coef); e->coef = NULL; }
+        e->failed = 1;
+        s_dec4_n++;                       /* sticky: don't retry every gemv */
+        return NULL;
+    }
+
+    t0 = esp_timer_get_time();
+    for (i = 0; i < out; i++) {
+        const uint8_t  *row = packed + (size_t)i * rowb;
+        int8_t         *w   = e->wq8 + (size_t)i * in_pad;
+        const uint16_t *nrm = (const uint16_t *)(const void *)
+                              (packed + (size_t)out * rowb) + (size_t)i * ng;
+        for (j = 0; j < rowb; j++)
+            ((uint16_t *)(void *)w)[j] = tab4[row[j]];
+        for (g = 0; g < ng; g++)
+            e->coef[(size_t)i * ng + g] = nd_f16(nrm[g]) * inv_sw;
+    }
+
+    xSemaphoreTake(s_stage_mu, portMAX_DELAY);
+    if (s_stage_bytes + bytes > ND_P4_STAGE_BUDGET) {   /* raced: roll back */
+        heap_caps_free(e->wq8); heap_caps_free(e->coef);
+        e->wq8 = NULL; e->coef = NULL;
+        e->failed = 1;
+        printf("EVT p4 dec4 skipped (budget) rows=%u\n", (unsigned)out);
+    } else {
+        s_stage_bytes += bytes;
+    }
+    s_dec4_n++;
+    xSemaphoreGive(s_stage_mu);
+    if (e->wq8) {
+        printf("EVT p4 dec4 rows=%u bytes=%u total=%u ms=%d\n",
+               (unsigned)out, (unsigned)bytes, (unsigned)s_stage_bytes,
+               (int)((esp_timer_get_time() - t0) / 1000));
+        fflush(stdout);
+    }
+    return e->wq8 ? e : NULL;
+}
+
+/* First-use verification: 4 rows through both kernels, PIE must track the
+ * float dot_group path within the int8 quantisation error. */
+static void pie_rows4_verify(const rows4_ctx *rc, const gemv_ctx *fc)
+{
+    float yf[4], yp[4];
+    float mean = 0.0f, worst = 0.0f;
+    uint32_t i;
+    int ok = 1;
+
+    xSemaphoreTake(s_stage_mu, portMAX_DELAY);
+    if (s_rows4_mode != 2) {
+        xSemaphoreGive(s_stage_mu);
+        return;
+    }
+    {
+        rows4_ctx rp = *rc;
+        gemv_ctx  fp = *fc;
+        rp.y = yp; fp.y = yf;
+        gemv_rows_offset(&fp, 0, 4);
+        pie_rows4_rows(&rp, 0, 4);
+    }
+    for (i = 0; i < 4u; i++) mean += yf[i] < 0 ? -yf[i] : yf[i];
+    mean /= 4.0f;
+    for (i = 0; i < 4u; i++) {
+        float d = yp[i] - yf[i];
+        if (d < 0) d = -d;
+        if (d > worst) worst = d;
+    }
+    ok = worst <= 0.10f * (mean + 1e-6f);   /* int8 per-group-max quant
+                                             * noise is a few percent on
+                                             * real activations; structural
+                                             * kernel bugs land >50% */
+    if (mean < 1e-5f) {
+        xSemaphoreGive(s_stage_mu);   /* degenerate input: retry next gemv */
+        return;
+    }
+    s_rows4_mode = ok ? 1 : 0;
+    printf("EVT rows4 pie %s worst=%.5f mean=%.5f\n",
+           ok ? "ok" : "mismatch", (double)worst, (double)mean);
+    fflush(stdout);
+    xSemaphoreGive(s_stage_mu);
+}
+
+/* Hook from nd_cq_gemv_rows: 1 when the PIE kernel handled the gemv. */
+static int nd_p4_rows4_gemv(const nd_cact *c, const nd_tensor *t, const void *blob,
+                            const float *xh, uint32_t r0, uint32_t nrows, float *y)
+{
+    nd_p4_dec4_ent *e;
+    rows4_ctx       rc;
+    gemv_ctx        fc;
+    uint32_t        in_pad = nd_cq_in_pad(t);
+    uint32_t        out, rowb;
+
+    if (s_rows4_mode < 1 || t->bits != 4 || t->group != 128u ||
+        in_pad > 2048u || in_pad % 128u || nrows < 4u)
+        return 0;      /* verify needs 4 rows; every phi slice has 4+ */
+    if (!pie_rows4_side(xh, in_pad))
+        return 0;
+    e = pie_rows4_dec4(c, t, blob);
+    if (e == NULL)
+        return 0;
+
+    rc.e      = e;
+    rc.xq     = s_rxq;
+    rc.sx     = s_rsx;
+    rc.y      = y;
+    rc.ngroup = in_pad / 128u;
+    rc.base   = r0;
+
+    if (s_rows4_mode == 2) {
+        out  = t->shape[0];
+        rowb = nd_cq_row_bytes(t);
+        fc.packed   = (const uint8_t *)nd_p4_stage(
+            blob, (uint32_t)((size_t)out * rowb + (size_t)out *
+                                                   nd_cq_groups(t) * 2));
+        fc.norms    = (const uint16_t *)(const void *)(fc.packed +
+                           (size_t)out * rowb);
+        fc.xh       = xh;
+        fc.cb       = nd_cact_codebook(c, t->bits);
+        fc.y        = y;
+        fc.ngroup   = nd_cq_groups(t);
+        fc.g        = t->group;
+        fc.bits     = t->bits;
+        fc.rowbytes = rowb;
+        fc.base     = r0;
+        pie_rows4_verify(&rc, &fc);
+    }
+    if (s_rows4_mode != 1)
+        return 0;
+    rc.y = y;
+    if (nrows < 8)
+        pie_rows4_rows(&rc, 0, nrows);   /* handoff costs more than 4 rows */
+    else
+        nd_parallel_rows(pie_rows4_rows, &rc, nrows);
+    return 1;
+}
+
+/* Synthetic on-device check: random packed row + random xh through the
+ * float dot_group reference and the decode + quantise + PIE pipeline.
+ * Returns 0 ok. */
+int nd_quant_p4_rows4_check(void)
+{
+    static const float cb[16] = {
+        -0.675f, -0.585f, -0.495f, -0.405f, -0.315f, -0.225f, -0.135f,
+        -0.045f,  0.045f,  0.135f,  0.225f,  0.315f,  0.405f,  0.495f,
+         0.585f,  0.675f
+    };
+    static const uint16_t nh[16] = {          /* 1.0 0.5 2.0 1.5 cycling */
+        0x3C00, 0x3800, 0x4000, 0x3E00, 0x3C00, 0x3800, 0x4000, 0x3E00,
+        0x3C00, 0x3800, 0x4000, 0x3E00, 0x3C00, 0x3800, 0x4000, 0x3E00
+    };
+    static uint8_t w[1024]  __attribute__((aligned(16)));
+    static float   xh[2048];
+    static int8_t  wq8[2048] __attribute__((aligned(16)));
+    uint16_t tab4[256];
+    int8_t   lv[16];
+    float    mx = 0.0f, sw, inv_sw, ref = 0.0f, pie = 0.0f;
+    uint32_t seed = 4242u, j, gi, i;
+
+    for (j = 0; j < 1024u; j++) {
+        seed = seed * 1664525u + 1013904223u;
+        w[j] = (uint8_t)(seed >> 13);
+    }
+    for (j = 0; j < 2048u; j++) {
+        seed = seed * 1664525u + 1013904223u;
+        xh[j] = ((float)(int32_t)(seed >> 8) / 8388608.0f) - 1.0f;
+    }
+    if (!pie_rows4_side(xh, 2048u))
+        return 1;
+
+    for (i = 0; i < 16u; i++)
+        if (fabsf(cb[i]) > mx)
+            mx = fabsf(cb[i]);
+    sw = 127.0f / mx;
+    inv_sw = 1.0f / sw;
+    for (i = 0; i < 16u; i++)
+        lv[i] = q8(cb[i] * sw);
+    for (i = 0; i < 256u; i++)
+        tab4[i] = (uint16_t)((uint8_t)lv[i & 15u] |
+                             (uint16_t)(uint8_t)lv[i >> 4] << 8);
+    for (j = 0; j < 1024u; j++)
+        ((uint16_t *)(void *)wq8)[j] = tab4[w[j]];
+
+    for (gi = 0; gi < 16u; gi++) {
+        ref += nd_f16(nh[gi]) *
+               dot_group(w, gi * 512u, 4u, 128u, cb, xh + gi * 128u);
+        pie += (nd_f16(nh[gi]) * inv_sw) * s_rsx[gi] *
+               (float)dot128_s8(wq8 + gi * 128u, s_rxq + gi * 128u);
+    }
+    printf("EVT rows4 chk flt=%.4f pie=%.4f rel=%.5f\n",
+           (double)ref, (double)pie,
+           (double)((pie - ref) / (ref + 1e-9f)));
+    fflush(stdout);
+    return (pie - ref) / (ref + 1e-9f) > 0.02f ||
+           (pie - ref) / (ref + 1e-9f) < -0.02f;
+}
+
+void nd_quant_p4_rows4_enable(void)
+{
+    if (nd_quant_p4_rows4_check() == 0)
+        s_rows4_mode = 2;    /* synthetic ok; verify on first real gemv too */
+    else
+        printf("EVT rows4 pie disabled (synthetic check failed)\n"),
+            fflush(stdout);
+}
+#endif /* ESP32P4 PIE rows4 */
+
 int nd_cq_q8_prepare(const nd_tensor *t, const float *x, uint32_t T, nd_q8_act *a)
 {
     uint32_t in = t->shape[1], in_pad = nd_cq_in_pad(t), ng = in_pad / 128;
@@ -1271,7 +1841,9 @@ void nd_cq_q8_gemm(const nd_cact *c, const nd_tensor *t, const void *blob,
     sw = 127.0f / mx;
     for (i = 0; i < nl; i++)
         lv[i] = q8(cb[i] * sw);
-    buf  = (uint8_t *)ND_QUANT_ALLOC(32 + 2 * in_pad + 1024 + 512);
+    buf  = (uint8_t *)nd_quant_scratch(32 + 2 * in_pad + 1024 + 512);
+    if (!buf)
+        return;                     /* a->mem is freed by the caller */
     g.wq[0] = (int8_t *)align16(buf);
     g.wq[1] = g.wq[0] + in_pad;
     tab2 = (uint32_t *)(void *)(g.wq[1] + in_pad);
@@ -1302,7 +1874,11 @@ void nd_cq_q8_gemm(const nd_cact *c, const nd_tensor *t, const void *blob,
          * it: the stem's pointwise layers (1000 positions x 128) re-read
          * 128 KB per output row. Run all rows on 32 KB tiles in SRAM. */
         uint32_t ng = in_pad / 128, tile = (32 * 1024) / in_pad, k0;
-        uint8_t *tb = (uint8_t *)ND_QUANT_ALLOC((size_t)tile * (in_pad + ng * sizeof(float)) + 32);
+        uint8_t *tb = (uint8_t *)nd_quant_scratch((size_t)tile * (in_pad + ng * sizeof(float)) + 32);
+        if (!tb) {
+            ND_QUANT_FREE(buf);
+            return;
+        }
         int8_t  *xq = (int8_t *)align16(tb);
         float   *sx = (float *)align16(xq + (size_t)tile * in_pad);
         for (k0 = 0; k0 < a->T; k0 += tile) {
@@ -1337,6 +1913,8 @@ static void gemm8(const nd_cact *c, const nd_tensor *t, const void *blob,
         a.mem = malloc(bytes);
 #endif
     }
+    if (!a.mem)
+        return;
     a.xq = (int8_t *)align16(a.mem);
     a.sx = (float *)align16(a.xq + (size_t)T * in_pad);
     a.T = T;
@@ -1383,7 +1961,9 @@ void nd_cq_gemm_rows(const nd_cact *c, const nd_tensor *t, const void *blob,
         tile = 1;
     if (tile > T)
         tile = T;
-    buf = (float *)ND_QUANT_ALLOC((2 * in_pad + 1024 + (size_t)tile * in_pad) * sizeof(float));
+    buf = (float *)nd_quant_scratch((2 * in_pad + 1024 + (size_t)tile * in_pad) * sizeof(float));
+    if (!buf)
+        return;
     tab = buf + 2 * in_pad;
     xt  = tab + 1024;
     if (t->bits == 2) {
